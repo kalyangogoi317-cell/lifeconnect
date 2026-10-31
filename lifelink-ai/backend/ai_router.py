@@ -23,8 +23,15 @@ _load_env_file()
 
 # Google Gemini API key (loaded from environment variable or .env)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_BASE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+
+# Multi-Model Cascade: automatically tries high-speed, high-quota models first
+# If one model hits 429 quota or 503, it instantly cascades to the next working model
+GEMINI_MODELS_CASCADE = [
+    "gemini-2.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash"
+]
 
 
 def _clean_base64(b64_str: str) -> tuple:
@@ -94,134 +101,140 @@ async def run_gemini_vision(task_type: str, system_prompt: str, user_prompt: str
         }
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=25.0) as client:
-            resp = await client.post(GEMINI_BASE_URL, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    candidate = candidates[0]
-                    content_parts = candidate.get("content", {}).get("parts", [])
-                    # Find part containing JSON
-                    res_text = ""
-                    for p in reversed(content_parts):
-                        txt = p.get("text", "")
-                        if txt and ("{" in txt or "}" in txt):
-                            res_text = txt
-                            break
-                        elif not res_text and txt:
-                            res_text = txt
+    for model_name in GEMINI_MODELS_CASCADE:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            async with httpx.AsyncClient(timeout=25.0) as client:
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        candidate = candidates[0]
+                        content_parts = candidate.get("content", {}).get("parts", [])
+                        # Find part containing JSON
+                        res_text = ""
+                        for p in reversed(content_parts):
+                            txt = p.get("text", "")
+                            if txt and ("{" in txt or "}" in txt):
+                                res_text = txt
+                                break
+                            elif not res_text and txt:
+                                res_text = txt
 
-                    parsed = _parse_json_safe(res_text)
-                    if parsed:
-                        print(f"[Gemini 2.5 Flash API] Successfully processed task '{task_type}'")
-                        
-                        # Normalize task_type == 'report'
-                        if task_type == "report":
-                            # 1. Normalize parameters / tests
-                            raw_params = parsed.get("parameters") or parsed.get("tests") or parsed.get("investigations") or []
-                            norm_params = []
-                            for p in raw_params:
-                                name = p.get("name") or p.get("investigation") or p.get("test_name") or "Investigation"
-                                val = p.get("value") or ""
-                                ref = p.get("reference_range") or p.get("normal_range") or "Normal"
-                                st = p.get("status") or "NORMAL"
-                                meaning = p.get("simple_meaning") or f"Measures physiological {name} level."
-                                norm_params.append({
-                                    "name": name,
-                                    "value": val,
-                                    "reference_range": ref,
-                                    "status": st.upper(),
-                                    "simple_meaning": meaning
-                                })
-                            parsed["parameters"] = norm_params
+                        parsed = _parse_json_safe(res_text)
+                        if parsed:
+                            print(f"[Gemini API - {model_name}] Successfully processed task '{task_type}'")
+                            
+                            # Normalize task_type == 'report'
+                            if task_type == "report":
+                                # 1. Normalize parameters / tests
+                                raw_params = parsed.get("parameters") or parsed.get("tests") or parsed.get("investigations") or []
+                                norm_params = []
+                                for p in raw_params:
+                                    name = p.get("name") or p.get("investigation") or p.get("test_name") or "Investigation"
+                                    val = p.get("value") or ""
+                                    ref = p.get("reference_range") or p.get("normal_range") or "Normal"
+                                    st = p.get("status") or "NORMAL"
+                                    meaning = p.get("simple_meaning") or f"Measures physiological {name} level."
+                                    norm_params.append({
+                                        "name": name,
+                                        "value": val,
+                                        "reference_range": ref,
+                                        "status": st.upper(),
+                                        "simple_meaning": meaning
+                                    })
+                                parsed["parameters"] = norm_params
 
-                            # 2. Normalize patient explanation
-                            parsed["simple_patient_explanation"] = (
-                                parsed.get("patient_explanation") or
-                                parsed.get("simple_patient_explanation") or
-                                parsed.get("clinical_summary") or
-                                "Report analyzed successfully."
-                            )
+                                # 2. Normalize patient explanation
+                                parsed["simple_patient_explanation"] = (
+                                    parsed.get("patient_explanation") or
+                                    parsed.get("simple_patient_explanation") or
+                                    parsed.get("clinical_summary") or
+                                    "Report analyzed successfully."
+                                )
 
-                            # 3. Normalize diet & lifestyle tips
-                            raw_tips = parsed.get("diet_and_lifestyle_tips") or parsed.get("diet_lifestyle_tips") or []
-                            if isinstance(raw_tips, str):
-                                parsed["diet_and_lifestyle_tips"] = [t.strip() for t in raw_tips.split(". ") if t.strip()]
-                            elif isinstance(raw_tips, list):
-                                parsed["diet_and_lifestyle_tips"] = raw_tips
-                            else:
-                                parsed["diet_and_lifestyle_tips"] = [
-                                    "Maintain balanced nutrition and adequate hydration.",
-                                    "Consult your physician for personalized medical evaluation."
-                                ]
-
-                            # 4. Normalize overall_status
-                            st_lower = str(parsed.get("overall_status", "")).lower()
-                            if "critical" in st_lower or "danger" in st_lower:
-                                parsed["overall_status"] = "Critical"
-                            elif "normal" in st_lower and "not" not in st_lower:
-                                parsed["overall_status"] = "Normal"
-                            else:
-                                parsed["overall_status"] = "Attention Required"
-
-                        # Normalize task_type == 'prescription'
-                        elif task_type == "prescription":
-                            raw_meds = parsed.get("medicines") or parsed.get("medications") or parsed.get("prescription") or []
-                            norm_meds = []
-                            for m in raw_meds:
-                                name = m.get("medicine_name") or m.get("name") or m.get("drug") or "Prescribed Medicine"
-                                dose = m.get("dosage") or m.get("dose") or "1 unit"
-                                
-                                # Parse timing cleanly
-                                timing = m.get("timing") or []
-                                if isinstance(timing, str):
-                                    t_str = timing.lower()
-                                    timing = []
-                                    if any(w in t_str for w in ["morning", "breakfast", "od", "am", "subah"]):
-                                        timing.append("Morning")
-                                    if any(w in t_str for w in ["afternoon", "lunch", "noon", "tds", "dophar"]):
-                                        timing.append("Afternoon")
-                                    if any(w in t_str for w in ["night", "dinner", "bed", "bd", "hs", "pm", "raat"]):
-                                        timing.append("Night")
-                                if not timing:
-                                    timing = ["Morning"]
-
-                                meal = m.get("meal_relation") or m.get("meal") or "After Food"
-                                if "before" in meal.lower() or "empty" in meal.lower():
-                                    meal = "Before Food"
+                                # 3. Normalize diet & lifestyle tips
+                                raw_tips = parsed.get("diet_and_lifestyle_tips") or parsed.get("diet_lifestyle_tips") or []
+                                if isinstance(raw_tips, str):
+                                    parsed["diet_and_lifestyle_tips"] = [t.strip() for t in raw_tips.split(". ") if t.strip()]
+                                elif isinstance(raw_tips, list):
+                                    parsed["diet_and_lifestyle_tips"] = raw_tips
                                 else:
-                                    meal = "After Food"
+                                    parsed["diet_and_lifestyle_tips"] = [
+                                        "Maintain balanced nutrition and adequate hydration.",
+                                        "Consult your physician for personalized medical evaluation."
+                                    ]
 
-                                dur = m.get("duration_days") or m.get("duration") or 5
-                                try:
-                                    if isinstance(dur, str):
-                                        d_match = re.search(r'\d+', dur)
-                                        dur = int(d_match.group(0)) if d_match else 5
-                                except Exception:
-                                    dur = 5
+                                # 4. Normalize overall_status
+                                st_lower = str(parsed.get("overall_status", "")).lower()
+                                if "critical" in st_lower or "danger" in st_lower:
+                                    parsed["overall_status"] = "Critical"
+                                elif "normal" in st_lower and "not" not in st_lower:
+                                    parsed["overall_status"] = "Normal"
+                                else:
+                                    parsed["overall_status"] = "Attention Required"
 
-                                norm_meds.append({
-                                    "medicine_name": name,
-                                    "dosage": dose,
-                                    "timing": timing,
-                                    "meal_relation": meal,
-                                    "duration_days": int(dur),
-                                    "confidence": m.get("confidence", "98%"),
-                                    "taken_today": False
-                                })
+                            # Normalize task_type == 'prescription'
+                            elif task_type == "prescription":
+                                raw_meds = parsed.get("medicines") or parsed.get("medications") or parsed.get("prescription") or []
+                                norm_meds = []
+                                for m in raw_meds:
+                                    name = m.get("medicine_name") or m.get("name") or m.get("drug") or "Prescribed Medicine"
+                                    dose = m.get("dosage") or m.get("dose") or "1 unit"
+                                    
+                                    # Parse timing cleanly
+                                    timing = m.get("timing") or []
+                                    if isinstance(timing, str):
+                                        t_str = timing.lower()
+                                        timing = []
+                                        if any(w in t_str for w in ["morning", "breakfast", "od", "am", "subah"]):
+                                            timing.append("Morning")
+                                        if any(w in t_str for w in ["afternoon", "lunch", "noon", "tds", "dophar"]):
+                                            timing.append("Afternoon")
+                                        if any(w in t_str for w in ["night", "dinner", "bed", "bd", "hs", "pm", "raat"]):
+                                            timing.append("Night")
+                                    if not timing:
+                                        timing = ["Morning"]
 
-                            parsed["medicines"] = norm_meds
-                            parsed["doctor_notes"] = parsed.get("doctor_notes") or parsed.get("notes") or "Prescription medicines extracted by Gemini 2.5 Flash Vision."
+                                    meal = m.get("meal_relation") or m.get("meal") or "After Food"
+                                    if "before" in meal.lower() or "empty" in meal.lower():
+                                        meal = "Before Food"
+                                    else:
+                                        meal = "After Food"
 
-                        return parsed
-            else:
-                print(f"[Gemini API] HTTP {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        print(f"[Gemini API Vision Exception] {e}")
+                                    dur = m.get("duration_days") or m.get("duration") or 5
+                                    try:
+                                        if isinstance(dur, str):
+                                            d_match = re.search(r'\d+', dur)
+                                            dur = int(d_match.group(0)) if d_match else 5
+                                    except Exception:
+                                        dur = 5
 
-    # Fallback in case of offline/network drop during live judge demo
+                                    norm_meds.append({
+                                        "medicine_name": name,
+                                        "dosage": dose,
+                                        "timing": timing,
+                                        "meal_relation": meal,
+                                        "duration_days": int(dur),
+                                        "confidence": m.get("confidence", "98%"),
+                                        "taken_today": False
+                                    })
+
+                                parsed["medicines"] = norm_meds
+                                parsed["doctor_notes"] = parsed.get("doctor_notes") or parsed.get("notes") or "Prescription medicines extracted by Gemini Vision."
+
+                            return parsed
+                elif resp.status_code == 429:
+                    print(f"[Gemini Cascade] Model '{model_name}' rate-limited (429), failing over to next model...")
+                    continue
+                else:
+                    print(f"[Gemini API - {model_name}] HTTP {resp.status_code}: {resp.text[:150]}")
+        except Exception as e:
+            print(f"[Gemini Exception on {model_name}] {e}")
+            continue
+
+    # Fallback in case all models fail or offline
     return _generate_fallback_response(task_type, user_prompt)
 
 
@@ -274,25 +287,31 @@ async def run_gemini_chat(messages: list, patient_context: dict = None) -> dict:
         }
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(GEMINI_BASE_URL, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    candidate = candidates[0]
-                    content_parts = candidate.get("content", {}).get("parts", [])
-                    if content_parts:
-                        reply_text = content_parts[0].get("text", "")
-                        return {
-                            "reply": reply_text,
-                            "model_used": "Google Gemini 2.5 Flash"
-                        }
-            else:
-                print(f"[Gemini Chat] HTTP {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        print(f"[Gemini Chat Exception] {e}")
+    for model_name in GEMINI_MODELS_CASCADE:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        candidate = candidates[0]
+                        content_parts = candidate.get("content", {}).get("parts", [])
+                        if content_parts:
+                            reply_text = content_parts[0].get("text", "")
+                            return {
+                                "reply": reply_text,
+                                "model_used": f"Google Gemini ({model_name})"
+                            }
+                elif resp.status_code == 429:
+                    print(f"[Gemini Chat Cascade] {model_name} rate-limited (429), trying next...")
+                    continue
+                else:
+                    print(f"[Gemini Chat - {model_name}] HTTP {resp.status_code}: {resp.text[:150]}")
+        except Exception as e:
+            print(f"[Gemini Chat Exception on {model_name}] {e}")
+            continue
 
     last_query = (messages[-1].get("content", "") if messages else "").lower()
     return {
@@ -362,41 +381,8 @@ def _generate_fallback_response(task_type: str, user_prompt: str) -> dict:
         }
     elif task_type == "prescription":
         return {
-            "doctor_notes": "Handwritten prescription analyzed via Gemini Vision. Bronchial asthma with secondary allergic rhinitis.",
-            "medicines": [
-                {
-                    "medicine_name": "Salbutamol Inhaler (100mcg)",
-                    "dosage": "2 puffs",
-                    "timing": ["Morning", "Night"],
-                    "meal_relation": "Before Food",
-                    "duration_days": 30,
-                    "confidence": "98%"
-                },
-                {
-                    "medicine_name": "Montelukast + Levocetirizine (10mg/5mg)",
-                    "dosage": "1 tablet",
-                    "timing": ["Night"],
-                    "meal_relation": "After Food",
-                    "duration_days": 10,
-                    "confidence": "96%"
-                },
-                {
-                    "medicine_name": "Pantoprazole 40mg",
-                    "dosage": "1 capsule",
-                    "timing": ["Morning"],
-                    "meal_relation": "Before Food",
-                    "duration_days": 7,
-                    "confidence": "99%"
-                },
-                {
-                    "medicine_name": "Paracetamol 650mg",
-                    "dosage": "1 tablet",
-                    "timing": ["Morning", "Afternoon", "Night"],
-                    "meal_relation": "After Food",
-                    "duration_days": 3,
-                    "confidence": "97%"
-                }
-            ]
+            "doctor_notes": "Could not extract medicines from image. Please ensure the prescription photo is clear and well-lit.",
+            "medicines": []
         }
     elif task_type == "report":
         return {

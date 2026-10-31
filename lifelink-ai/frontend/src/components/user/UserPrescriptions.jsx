@@ -146,6 +146,11 @@ export default function UserPrescriptions({ currentUser }) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const newPrescription = await res.json();
 
+      if (!newPrescription.medicines || newPrescription.medicines.length === 0) {
+        setErrorMsg('AI could not detect any readable medicines in this photo. Please make sure the prescription photo is clear, sharp, and well-lit, then try again.');
+        return;
+      }
+
       // 2. Automatically verify & push into user's personal timetable
       await fetch(`${API_BASE}/api/prescriptions/${newPrescription.id}/verify`, {
         method: 'PUT',

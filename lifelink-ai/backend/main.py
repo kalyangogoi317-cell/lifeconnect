@@ -347,13 +347,18 @@ async def trigger_emergency_sos(req: SOSRequest, db: Session = Depends(get_db)):
 @app.post("/api/analyze-prescription")
 async def analyze_prescription(req: PrescriptionAnalyzeRequest, db: Session = Depends(get_db)):
     system_prompt = (
-        "You are an expert Clinical Pharmacologist & Handwriting OCR specialist. "
-        "Extract doctor notes and medicine timetable schedule from this handwritten prescription image. "
-        "Strictly output JSON with keys: doctor_notes (string) and medicines (array of objects with "
-        "medicine_name, dosage, timing [list among Morning, Afternoon, Night], meal_relation ['After Food' or 'Before Food'], "
-        "duration_days (integer), confidence (string))."
+        "You are an expert Clinical Pharmacologist and Doctor Handwriting OCR Specialist. "
+        "Your task is to transcribe and accurately extract every single prescribed medicine, tablet, capsule, injection, or syrup from the image. "
+        "Clinical instructions: "
+        "1. Identify the medicine name (brand or generic salt) and dosage/strength (e.g. 500mg, 650mg, 40mg, 1 tab, 5ml). "
+        "2. Parse timing schedules: '1-0-1' means ['Morning', 'Night']; '1-1-1' or 'TDS' means ['Morning', 'Afternoon', 'Night']; "
+        "'1-0-0' or 'OD' or 'Morning' means ['Morning']; '0-0-1' or 'HS' or 'Night' means ['Night']; '0-1-0' means ['Afternoon']. "
+        "3. Parse meal relation: 'Before Food' (or AC, empty stomach, BBF), 'After Food' (or PC, after lunch/dinner). "
+        "4. Duration in days (e.g. 3, 5, 7, 10, 14, 30). "
+        "Strictly output JSON with keys: doctor_notes (string summarizing patient diagnosis or doctor notes) "
+        "and medicines (array of objects with keys: medicine_name, dosage, timing [list among Morning, Afternoon, Night], meal_relation ['Before Food' or 'After Food'], duration_days (integer), confidence (string))."
     )
-    user_prompt = "Transcribe and extract the prescription medicines and schedules with high clinical precision."
+    user_prompt = "Transcribe and extract the prescription medicines and schedules with high clinical precision from this prescription photo."
 
     ai_result = await run_hybrid_vision_ai(
         task_type="prescription",
